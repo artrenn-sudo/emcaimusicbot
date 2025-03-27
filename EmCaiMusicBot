@@ -1,0 +1,263 @@
+import discord
+import asyncio
+import yt_dlp
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+from discord import app_commands
+from discord.ext import commands
+import os
+from dotenv import load_dotenv
+import subprocess
+
+load_dotenv()
+
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+
+# Authenticate Spotipy
+sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(client_id=SPOTIFY_CLIENT_ID,
+                                                           client_secret=SPOTIFY_CLIENT_SECRET))
+
+
+# FFmpeg Options
+FFMPEG_OPTIONS = {'options': '-vn'}
+
+# yt-dlp Options
+ytdl_format_options = {
+    'format': 'bestaudio/best',
+    'postprocessors': [{
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': 'mp3',
+        'preferredquality': '192',
+    }],
+}
+ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
+
+# Set up bot with intents
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Music Player Class
+class MusicPlayer:
+    def __init__(self):
+        self.queue = asyncio.Queue()
+        self.current = None
+        self.loop_track = False
+        self.loop_queue = False
+        self.volume = 1.0
+
+    async def add_to_queue(self, track):
+        await self.queue.put(track)
+
+    async def get_next_track(self):
+        if self.queue.empty():
+            return None
+        return await self.queue.get()
+
+    async def get_queue(self):
+        return [track['title'] for track in list(self.queue._queue)]
+
+    def toggle_loop_track(self):
+        self.loop_track = not self.loop_track
+
+    def toggle_loop_queue(self):
+        self.loop_queue = not self.loop_queue
+
+    def set_volume(self, volume: float):
+        self.volume = volume
+
+players = {}
+
+def search_youtube(query):
+    """Search YouTube and return the first result."""
+    try:
+        with yt_dlp.YoutubeDL({'format': 'bestaudio', 'quiet': True}) as ydl:
+            info = ydl.extract_info(f"ytsearch:{query}", download=False)
+            if 'entries' in info and len(info['entries']) > 0:
+                return {'title': info['entries'][0]['title'], 'url': info['entries'][0]['url']}
+    except Exception as e:
+        print(f"Error searching YouTube: {e}")
+    return None
+
+def get_spotify_tracks(playlist_url):
+    """Extract song titles from a Spotify playlist URL."""
+    try:
+        playlist_id = playlist_url.split("/")[-1].split("?")[0]
+        results = sp.playlist_tracks(playlist_id)
+        return [f"{item['track']['name']} {item['track']['artists'][0]['name']}" for item in results["items"]]
+    except Exception as e:
+        print(f"Error fetching Spotify playlist: {e}")
+        return []
+
+async def download_spotify_playlist(playlist_url):
+    """Download a Spotify playlist using spotdl."""
+    try:
+        command = ["spotdl", playlist_url]
+        subprocess.run(command, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Error downloading playlist: {e}")
+
+@bot.event
+async def on_ready():
+    """Sync commands when bot is ready."""
+    try:
+        await bot.tree.sync()
+        print(f"{bot.user} is online and commands are synced!")
+    except Exception as e:
+        print(f"Error syncing commands: {e}")
+
+async def play_next(interaction):
+    """Handles playing the next track in the queue."""
+    player = players.get(interaction.guild.id)
+    if not player:
+        return
+
+    if player.loop_track and player.current:
+        await player.add_to_queue(player.current)
+
+    next_track = await player.get_next_track()
+
+    if player.loop_queue and not next_track:
+        temp_queue = list(player.queue._queue)
+        for track in temp_queue:
+            await player.add_to_queue(track)
+        next_track = await player.get_next_track()
+
+    if not next_track:
+        await interaction.followup.send("⏹ Queue is empty! Stopping playback.")
+        await interaction.guild.voice_client.disconnect()
+        players.pop(interaction.guild.id, None)
+        return
+
+    player.current = next_track
+    voice_client = interaction.guild.voice_client
+
+    def after_play(error):
+        if error:
+            print(f"Error: {error}")
+        fut = asyncio.run_coroutine_threadsafe(play_next(interaction), bot.loop)
+        try:
+            fut.result()
+        except Exception as e:
+            print(f"Error in after_play: {e}")
+
+    voice_client.play(
+        discord.FFmpegPCMAudio(next_track['url'], **FFMPEG_OPTIONS),
+        after=after_play
+    )
+    voice_client.source = discord.PCMVolumeTransformer(voice_client.source)
+    voice_client.source.volume = player.volume
+    await interaction.followup.send(f"🎵 Now playing: {next_track['title']}")
+
+@bot.tree.command(name="play", description="Play a song from YouTube or a Spotify playlist.")
+async def play(interaction: discord.Interaction, query: str):
+    await interaction.response.defer()
+
+    guild_id = interaction.guild.id
+    if guild_id not in players:
+        players[guild_id] = MusicPlayer()
+    player = players[guild_id]
+
+    voice_client = interaction.guild.voice_client
+    if not voice_client or not voice_client.is_connected():
+        if interaction.user.voice:
+            channel = interaction.user.voice.channel
+            voice_client = await channel.connect()
+        else:
+            await interaction.followup.send("❌ You need to be in a voice channel!")
+            return
+
+    if "spotify.com/playlist" in query:
+        tracks = get_spotify_tracks(query)
+        if not tracks:
+            await interaction.followup.send("❌ Could not fetch songs from the Spotify playlist.")
+            return
+        await download_spotify_playlist(query)  # Download the playlist
+        for track in tracks:
+            song = search_youtube(track)
+            if song:
+                await player.add_to_queue(song)
+        await interaction.followup.send(f"🎶 Added {len(tracks)} songs from Spotify playlist to the queue.")
+    else:
+        song = search_youtube(query)
+        if not song:
+            await interaction.followup.send("❌ Could not find the song on YouTube.")
+            return
+        await player.add_to_queue(song)
+        await interaction.followup.send(f"🎵 Added **{song['title']}** to the queue.")
+
+    if not voice_client.is_playing():
+        await play_next(interaction)
+
+@bot.tree.command(name="skip", description="Skip the current song")
+async def skip(interaction: discord.Interaction):
+    voice_client = interaction.guild.voice_client
+    if voice_client and voice_client.is_playing():
+        voice_client.stop()
+        await interaction.response.send_message("⏭ Skipped!")
+    else:
+        await interaction.response.send_message("❌ Nothing is playing!")
+
+@bot.tree.command(name="queue", description="Show the current queue")
+async def queue(interaction: discord.Interaction):
+    player = players.get(interaction.guild.id)
+    if not player or player.queue.empty():
+        await interaction.response.send_message("📭 The queue is empty!")
+        return
+    queue_list = "\n".join(await player.get_queue())
+    await interaction.response.send_message(f"🎶 **Queue:**\n{queue_list}")
+
+@bot.tree.command(name="loop", description="Toggle loop mode")
+async def loop(interaction: discord.Interaction):
+    player = players.get(interaction.guild.id)
+    if not player:
+        await interaction.response.send_message("❌ No music is playing!")
+        return
+    player.toggle_loop_track()
+    status = "enabled" if player.loop_track else "disabled"
+    await interaction.response.send_message(f"🔁 Loop is now **{status}**")
+
+@bot.tree.command(name="pause", description="Pause the music")
+async def pause(interaction: discord.Interaction):
+    voice_client = interaction.guild.voice_client
+    if voice_client and voice_client.is_playing():
+        voice_client.pause()
+        await interaction.response.send_message("⏸ Paused!")
+    else:
+        await interaction.response.send_message("❌ Nothing is playing!")
+
+@bot.tree.command(name="resume", description="Resume the music")
+async def resume(interaction: discord.Interaction):
+    voice_client = interaction.guild.voice_client
+    if voice_client and voice_client.is_paused():
+        voice_client.resume()
+        await interaction.response.send_message("▶️ Resumed!")
+    else:
+        await interaction.response.send_message("❌ Nothing to resume!")
+
+@bot.tree.command(name="volume", description="Change the volume (0-100)")
+async def volume(interaction: discord.Interaction, level: int):
+    player = players.get(interaction.guild.id)
+    if not player:
+        await interaction.response.send_message("❌ No music is playing!")
+        return
+    if 0 <= level <= 100:
+        player.set_volume(level / 100)
+        interaction.guild.voice_client.source.volume = player.volume
+        await interaction.response.send_message(f"🔊 Volume set to {level}%")
+    else:
+        await interaction.response.send_message("❌ Volume must be between 0 and 100!")
+
+@bot.tree.command(name="stop", description="Stop playback and clear the queue.")
+async def stop(interaction: discord.Interaction):
+    voice_client = interaction.guild.voice_client
+    if voice_client and voice_client.is_connected():
+        await voice_client.disconnect()
+        players.pop(interaction.guild.id, None)
+        await interaction.response.send_message("⏹ Stopped playback and cleared the queue.")
+    else:
+        await interaction.response.send_message("❌ The bot is not connected to a voice channel!")
+
+bot.run(TOKEN)
